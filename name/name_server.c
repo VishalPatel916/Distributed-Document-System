@@ -4,35 +4,13 @@
 #include <time.h>
 #include <stdarg.h>
 
+#include "name_globals.h"
+#include "hash_cache.h"
+#include "fault_tolerance.h"
+#include "catalog.h"
+
 // --- Global Log File ---
 FILE* nm_log_file;
-
-// --- 1. NM's Internal Data Structures (C-Style) ---
-#define MAX_CONNECTIONS FD_SETSIZE
-typedef struct { int active; char username[MAX_USERNAME]; char ip_addr[MAX_IP_LEN]; } ClientInfo;
-typedef struct { 
-    int active; 
-    char ip[MAX_IP_LEN]; 
-    int client_port; 
-    char ip_addr[MAX_IP_LEN]; 
-    char ss_id[MAX_USERNAME];    // Unique identifier (IP:port)
-    time_t last_heartbeat;       // Last successful heartbeat
-    int missed_heartbeats;       // Counter for failure detection
-} SSInfo;
-typedef struct {
-    int active;
-    char filename[MAX_FILENAME];
-    int ss_sock_fd; 
-    char owner[MAX_USERNAME];
-    AccessEntry access_list[MAX_PERMISSIONS_PER_FILE];
-    int access_count;
-    long file_size;
-    int word_count;
-    int char_count;
-    time_t last_modified;
-    time_t last_accessed;
-    int backup_ss_sock;          // Socket of backup storage server
-} FileMetadata;
 
 // --- 2. The NM's Global State ---
 ClientInfo client_state[MAX_CONNECTIONS];
@@ -53,28 +31,6 @@ typedef struct {
 AccessRequest access_requests[MAX_ACCESS_REQUESTS];
 int next_request_id = 1;
 
-// --- 3. EFFICIENT SEARCH STRUCTURES ---
-#define HASH_SIZE 1024 // Hash table size (power of 2)
-#define CACHE_SIZE 5   // LRU cache for recent lookups
-
-// Hash Map Node for O(1) lookup
-typedef struct HashNode {
-    char key[MAX_FILENAME];
-    int slot_index; // Index in file_catalog
-    struct HashNode* next; // Collision handling via chaining
-} HashNode;
-
-HashNode* hash_table[HASH_SIZE];
-
-// LRU Cache Entry
-typedef struct {
-    int valid;
-    char key[MAX_FILENAME];
-    int slot_index;
-} CacheEntry;
-
-CacheEntry lru_cache[CACHE_SIZE];
-
 // --- 4. Logging Function ---
 void log_event(const char* format, ...) {
     char time_buf[50]; time_t now = time(NULL); strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", localtime(&now));
@@ -84,302 +40,91 @@ void log_event(const char* format, ...) {
     fflush(nm_log_file);
 }
 
-// --- 5. HASH MAP & CACHE FUNCTIONS ---
 
-// Simple djb2 hash function
-unsigned long hash_func(char *str) {
-    unsigned long hash = 5381;
-    int c;
-    while ((c = *str++)) hash = ((hash << 5) + hash) + c;
-    return hash % HASH_SIZE;
+void handle_client_register(int sock_fd, char* peer_ip) {
+    Msg_Client_Register msg; 
+    recv(sock_fd, &msg, sizeof(msg), 0);
+    log_event("Socket %d (%s): CLIENT registered as '%s'", sock_fd, peer_ip, msg.username);
+    
+    client_state[sock_fd].active = 1; 
+    strncpy(client_state[sock_fd].username, msg.username, MAX_USERNAME);
+    strncpy(client_state[sock_fd].ip_addr, peer_ip, MAX_IP_LEN);
+    ss_state[sock_fd].active = 0;
+    
+    send_ok_response(sock_fd);
 }
 
-void add_to_cache(char* filename, int slot_index) {
-    // Check if already in cache
-    for(int i=0; i<CACHE_SIZE; i++) {
-        if(lru_cache[i].valid && strcmp(lru_cache[i].key, filename) == 0) return;
-    }
-    // Shift right (evict last)
-    for(int i=CACHE_SIZE-1; i > 0; i--) {
-        lru_cache[i] = lru_cache[i-1];
-    }
-    // Insert at front
-    strcpy(lru_cache[0].key, filename);
-    lru_cache[0].slot_index = slot_index;
-    lru_cache[0].valid = 1;
-}
-
-void invalidate_cache(char* filename) {
-    for(int i=0; i<CACHE_SIZE; i++) {
-        if(lru_cache[i].valid && strcmp(lru_cache[i].key, filename) == 0) {
-            lru_cache[i].valid = 0;
+void handle_ss_register(int sock_fd, char* peer_ip) {
+    Msg_SS_Register msg; 
+    recv(sock_fd, &msg, sizeof(msg), 0);
+    log_event("Socket %d (%s): SS registered at %s:%d. Expecting %d files.", sock_fd, peer_ip, msg.ss_ip, msg.client_port, msg.file_count);
+    
+    ss_state[sock_fd].active = 1; 
+    strncpy(ss_state[sock_fd].ip, msg.ss_ip, MAX_IP_LEN);
+    ss_state[sock_fd].client_port = msg.client_port; 
+    strncpy(ss_state[sock_fd].ip_addr, peer_ip, MAX_IP_LEN);
+    
+    // Assign SS ID for heartbeat tracking
+    snprintf(ss_state[sock_fd].ss_id, MAX_USERNAME, "%s:%d", msg.ss_ip, msg.client_port);
+    ss_state[sock_fd].last_heartbeat = time(NULL);
+    ss_state[sock_fd].missed_heartbeats = 0;
+    client_state[sock_fd].active = 0;
+    
+    // Detect recovery scenario: file_count==0 but has inactive files with backups
+    int is_recovering = (msg.file_count == 0);
+    if (is_recovering) {
+        int has_backups = 0;
+        for (int i = 0; i < MAX_FILES_IN_SYSTEM; i++) {
+            if (!file_catalog[i].active && file_catalog[i].ss_sock_fd == sock_fd && 
+                file_catalog[i].backup_ss_sock >= 0) {
+                has_backups = 1;
+                break;
+            }
         }
-    }
-}
-
-void add_to_hashmap(char* filename, int slot_index) {
-    unsigned long idx = hash_func(filename);
-    HashNode* new_node = (HashNode*)malloc(sizeof(HashNode));
-    strcpy(new_node->key, filename);
-    new_node->slot_index = slot_index;
-    new_node->next = hash_table[idx]; // Insert at head
-    hash_table[idx] = new_node;
-}
-
-void remove_from_hashmap(char* filename) {
-    unsigned long idx = hash_func(filename);
-    HashNode* current = hash_table[idx];
-    HashNode* prev = NULL;
-    while(current != NULL) {
-        if(strcmp(current->key, filename) == 0) {
-            if(prev == NULL) hash_table[idx] = current->next;
-            else prev->next = current->next;
-            free(current);
+        if (has_backups) {
+            log_event("  -> Detected recovery! Syncing files from backups...");
+            sync_files_to_recovering_ss(sock_fd);
+            send_ok_response(sock_fd);
             return;
         }
-        prev = current;
-        current = current->next;
-    }
-}
-
-// --- 6. Helper Functions ---
-// O(1) Find Function using Cache + Hash Map
-int find_file_slot(char* filename) {
-    // 1. Check Cache (Fastest)
-    for(int i=0; i<CACHE_SIZE; i++) {
-        if(lru_cache[i].valid && strcmp(lru_cache[i].key, filename) == 0) {
-            log_event("[CACHE HIT] '%s' found in cache at position %d", filename, i);
-            return lru_cache[i].slot_index;
-        }
-    }
-
-    // 2. Check Hash Map (Fast)
-    unsigned long idx = hash_func(filename);
-    HashNode* node = hash_table[idx];
-    while(node != NULL) {
-        if(strcmp(node->key, filename) == 0) {
-            // Found! Update cache and return
-            log_event("[HASH HIT] '%s' found in hash map, adding to cache", filename);
-            add_to_cache(filename, node->slot_index);
-            return node->slot_index;
-        }
-        node = node->next;
-    }
-
-    log_event("[MISS] '%s' not found in cache or hash map", filename);
-    return -1; // Not found
-}
-int find_empty_file_slot() { for (int i = 0; i < MAX_FILES_IN_SYSTEM; i++) { if (file_catalog[i].active == 0) return i; } return -1; }
-int find_available_ss() { for (int i = 0; i < MAX_CONNECTIONS; i++) { if (ss_state[i].active) return i; } return -1; }
-void send_ok_response(int sock) { Header header; header.type = RES_OK; header.payload_size = 0; if (send(sock, &header, sizeof(Header), 0) < 0) { log_event("Failed to send OK response to socket %d", sock); } }
-void handle_disconnect(int sock_fd) {
-    if (client_state[sock_fd].active) {
-        log_event("Client '%s' (Socket %d, IP: %s) disconnected.", client_state[sock_fd].username, sock_fd, client_state[sock_fd].ip_addr);
-        client_state[sock_fd].active = 0;
-    } else if (ss_state[sock_fd].active) {
-        log_event("Storage Server (Socket %d, IP: %s) disconnected.", sock_fd, ss_state[sock_fd].ip_addr);
-        ss_state[sock_fd].active = 0;
-        log_event("De-listing its files from the catalog...");
-        for (int i = 0; i < MAX_FILES_IN_SYSTEM; i++) {
-            if (file_catalog[i].active && file_catalog[i].ss_sock_fd == sock_fd) {
-                // REMOVE FROM HASHMAP & CACHE
-                remove_from_hashmap(file_catalog[i].filename);
-                invalidate_cache(file_catalog[i].filename);
-                
-                file_catalog[i].active = 0;
-                log_event("  -> De-listed '%s'", file_catalog[i].filename);
-            }
-        }
-    } else { log_event("Socket %d (unregistered) disconnected.", sock_fd); }
-    close(sock_fd);
-}
-
-PermissionLevel get_permission(FileMetadata* meta, char* username) {
-    if (strcmp(meta->owner, username) == 0) { return READ_WRITE; }
-    for (int i = 0; i < meta->access_count; i++) {
-        if (strcmp(meta->access_list[i].username, username) == 0) {
-            return meta->access_list[i].permission;
-        }
-    }
-    return NO_PERM;
-}
-int has_read_access(FileMetadata* meta, char* username) { return get_permission(meta, username) >= READ_ONLY; }
-int has_write_access(FileMetadata* meta, char* username) { return get_permission(meta, username) == READ_WRITE; }
-
-void send_full_metadata(int sock_fd, FileMetadata* meta) {
-    Header hdr; hdr.payload_size = sizeof(Msg_Full_Metadata);
-    Msg_Full_Metadata msg;
-    strncpy(msg.filename, meta->filename, MAX_FILENAME);
-    strncpy(msg.owner, meta->owner, MAX_USERNAME);
-    msg.file_size = meta->file_size; msg.word_count = meta->word_count; msg.char_count = meta->char_count;
-    msg.last_modified = meta->last_modified; msg.last_accessed = meta->last_accessed; msg.access_count = meta->access_count;
-    if (meta->active == 1) { hdr.type = RES_VIEW_ITEM_LONG; meta->active = 2; }
-    else { hdr.type = RES_INFO; }
-    send(sock_fd, &hdr, sizeof(hdr), 0); send(sock_fd, &msg, sizeof(msg), 0);
-    if (msg.access_count > 0) { send(sock_fd, meta->access_list, sizeof(AccessEntry) * msg.access_count, 0); }
-}
-
-// --- NEW HELPER: NM acts as a client to get file content from SS ---
-// Returns a malloc'd buffer with the file content, or NULL on failure.
-// Note: This is a simple implementation, assumes script is not huge.
-char* get_file_content_from_ss(SSInfo* ss, char* filename) {
-    int ss_sock;
-    struct sockaddr_in ss_addr;
-    
-    // 1. Connect to the SS's CLIENT port
-    ss_sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (ss_sock < 0) { log_event("  -> EXEC: socket() failed"); return NULL; }
-
-    memset(&ss_addr, 0, sizeof(ss_addr));
-    ss_addr.sin_family = AF_INET;
-    ss_addr.sin_port = htons(ss->client_port);
-    if (inet_pton(AF_INET, ss->ip, &ss_addr.sin_addr) <= 0) {
-        log_event("  -> EXEC: inet_pton() failed"); close(ss_sock); return NULL;
-    }
-    if (connect(ss_sock, (struct sockaddr *)&ss_addr, sizeof(ss_addr)) < 0) {
-        log_event("  -> EXEC: connect() to SS failed"); close(ss_sock); return NULL;
-    }
-
-    // 2. Send a normal REQ_CLIENT_READ
-    Header req_hdr;
-    req_hdr.type = REQ_CLIENT_READ;
-    req_hdr.payload_size = sizeof(Msg_Filename_Request);
-    Msg_Filename_Request req_msg;
-    strncpy(req_msg.filename, filename, MAX_FILENAME);
-    send(ss_sock, &req_hdr, sizeof(req_hdr), 0);
-    send(ss_sock, &req_msg, sizeof(req_msg), 0);
-    
-    // 3. Wait for handshake
-    Header res_hdr;
-    if (recv(ss_sock, &res_hdr, sizeof(res_hdr), 0) <= 0 || res_hdr.type != RES_SS_FILE_OK) {
-        log_event("  -> EXEC: SS did not send RES_SS_FILE_OK");
-        close(ss_sock); return NULL;
-    }
-
-    // 4. Malloc a buffer and receive the file content
-    // Warning: This is a simple implementation. A robust one would
-    // realloc() as needed. 16KB max script size.
-    int max_script_size = 16384;
-    char* script_content = (char*)malloc(max_script_size);
-    if (script_content == NULL) { close(ss_sock); return NULL; }
-    
-    int total_bytes = 0;
-    int nbytes = 0;
-    while(total_bytes < max_script_size - 1 &&
-          (nbytes = recv(ss_sock, script_content + total_bytes, max_script_size - 1 - total_bytes, 0)) > 0) {
-        total_bytes += nbytes;
-    }
-    script_content[total_bytes] = '\0'; // Null-terminate the script
-    
-    close(ss_sock);
-    log_event("  -> EXEC: Successfully fetched script content (%d bytes).", total_bytes);
-    return script_content;
-}
-
-// --- Fault Tolerance Helper Functions ---
-int find_backup_ss(int primary_sock) {
-    // Find a different active SS to use as backup
-    for (int i = 0; i < MAX_CONNECTIONS; i++) {
-        if (ss_state[i].active && i != primary_sock) {
-            return i;
-        }
-    }
-    return -1; // No backup available
-}
-
-int count_active_ss() {
-    int count = 0;
-    for (int i = 0; i < MAX_CONNECTIONS; i++) {
-        if (ss_state[i].active) count++;
-    }
-    return count;
-}
-
-void replicate_to_backup(int backup_sock, FileMetadata* file) {
-    // Send async replication request to backup SS
-    Header header;
-    header.type = REQ_REPLICATE_FILE;
-    header.payload_size = sizeof(Msg_Replicate_File);
-    
-    Msg_Replicate_File rep_msg;
-    strncpy(rep_msg.filename, file->filename, MAX_FILENAME);
-    strncpy(rep_msg.owner, file->owner, MAX_USERNAME);
-    rep_msg.access_count = file->access_count;
-    for (int i = 0; i < file->access_count; i++) {
-        rep_msg.access_list[i] = file->access_list[i];
-    }
-    rep_msg.file_size = file->file_size;
-    
-    // Use MSG_DONTWAIT for async send
-    if (send(backup_sock, &header, sizeof(header), MSG_DONTWAIT) < 0) {
-        log_event("  -> Warning: Failed to send replication header to backup SS");
-        return;
-    }
-    if (send(backup_sock, &rep_msg, sizeof(rep_msg), MSG_DONTWAIT) < 0) {
-        log_event("  -> Warning: Failed to send replication data to backup SS");
-        return;
     }
     
-    log_event("  -> Async replication initiated for '%s' to backup SS (sock %d)", 
-             file->filename, backup_sock);
-}
-
-void sync_file_to_recovering_ss(int recovering_sock, int backup_sock, const char* filename) {
-    // Request file content from backup SS
-    Header req_header;
-    req_header.type = REQ_GET_FILE_CONTENT;
-    req_header.payload_size = sizeof(Msg_Sync_File);
-    
-    Msg_Sync_File sync_msg;
-    strncpy(sync_msg.filename, filename, MAX_FILENAME);
-    
-    send(backup_sock, &req_header, sizeof(req_header), 0);
-    send(backup_sock, &sync_msg, sizeof(sync_msg), 0);
-    
-    // Receive file size and content from backup
-    long file_size;
-    recv(backup_sock, &file_size, sizeof(long), 0);
-    
-    if (file_size > 0) {
-        char* content = malloc(file_size);
-        if (content) {
-            int received = 0;
-            while (received < file_size) {
-                int bytes = recv(backup_sock, content + received, file_size - received, 0);
-                if (bytes <= 0) break;
-                received += bytes;
+    log_event("Receiving file list from SS %d...", sock_fd);
+    for (int i = 0; i < msg.file_count; i++) {
+        Msg_File_Item item; 
+        recv(sock_fd, &item, sizeof(item), 0);
+        int slot = find_empty_file_slot();
+        
+        if (slot != -1) {
+            file_catalog[slot].active = 1; 
+            strncpy(file_catalog[slot].filename, item.filename, MAX_FILENAME);
+            file_catalog[slot].ss_sock_fd = sock_fd; 
+            strncpy(file_catalog[slot].owner, item.owner, MAX_USERNAME);
+            file_catalog[slot].access_count = item.access_count;
+            for (int j = 0; j < item.access_count; j++) {
+                file_catalog[slot].access_list[j] = item.access_list[j];
             }
             
-            // Send to recovering SS
-            Header sync_header;
-            sync_header.type = REQ_SYNC_FROM_BACKUP;
-            sync_header.payload_size = sizeof(Msg_Sync_File);
+            // Assign backup SS if multiple SS available
+            if (count_active_ss() >= 2) {
+                int backup = find_backup_ss(sock_fd);
+                if (backup >= 0) {
+                    file_catalog[slot].backup_ss_sock = backup;
+                    replicate_to_backup(backup, &file_catalog[slot]);
+                } else {
+                    file_catalog[slot].backup_ss_sock = -1;
+                }
+            } else {
+                file_catalog[slot].backup_ss_sock = -1;
+            }
             
-            send(recovering_sock, &sync_header, sizeof(sync_header), 0);
-            send(recovering_sock, &sync_msg, sizeof(sync_msg), 0);
-            send(recovering_sock, &file_size, sizeof(long), 0);
-            send(recovering_sock, content, file_size, 0);
-            
-            free(content);
-            log_event("  -> Synced file '%s' (%ld bytes) to recovering SS", filename, file_size);
+            // ADD TO HASHMAP
+            add_to_hashmap(item.filename, slot);
+            log_event("  -> Cataloged '%s' (owner: %s, %d access entries) in slot %d", 
+                item.filename, item.owner, item.access_count, slot);
         }
     }
-}
-
-void sync_files_to_recovering_ss(int recovering_sock) {
-    // Find all files that belong to this SS and sync from their backups
-    int synced_count = 0;
-    for (int i = 0; i < MAX_FILES_IN_SYSTEM; i++) {
-        if (!file_catalog[i].active && file_catalog[i].ss_sock_fd == recovering_sock && 
-            file_catalog[i].backup_ss_sock >= 0 && ss_state[file_catalog[i].backup_ss_sock].active) {
-            
-            sync_file_to_recovering_ss(recovering_sock, file_catalog[i].backup_ss_sock, 
-                                      file_catalog[i].filename);
-            file_catalog[i].active = 1; // Reactivate file
-            synced_count++;
-        }
-    }
-    log_event("  -> Recovery complete: synced %d files to SS (sock %d)", synced_count, recovering_sock);
+    send_ok_response(sock_fd);
 }
 
 
@@ -409,6 +154,15 @@ int main() {
     fdmax = listener_sock;
     log_event("Name Server listening on port %d...", NM_PORT);
 
+    // ========================================================================
+    // MAIN EVENT LOOP (select-based multiplexing)
+    // 
+    // Two-Phase Communication Architecture:
+    // 1. Clients and SSs connect to this Name Server (NM) to register.
+    // 2. When a client wants to Read/Write/Stream, they request the NM.
+    // 3. The NM returns the IP:Port of the SS that holds the file.
+    // 4. The client then connects DIRECTLY to the SS for data transfer.
+    // ========================================================================
     while (1) {
         read_set = master_set;
         
@@ -474,78 +228,11 @@ int main() {
                         getpeername(sock_fd, (struct sockaddr*)&addr, &len); char* peer_ip = inet_ntoa(addr.sin_addr);
                         switch (header.type) {
                             case REQ_CLIENT_REGISTER: {
-                                Msg_Client_Register msg; recv(sock_fd, &msg, sizeof(msg), 0);
-                                log_event("Socket %d (%s): CLIENT registered as '%s'", sock_fd, peer_ip, msg.username);
-                                client_state[sock_fd].active = 1; strncpy(client_state[sock_fd].username, msg.username, MAX_USERNAME);
-                                strncpy(client_state[sock_fd].ip_addr, peer_ip, MAX_IP_LEN);
-                                ss_state[sock_fd].active = 0;
-                                send_ok_response(sock_fd);
+                                handle_client_register(sock_fd, peer_ip);
                                 break;
                             }
                             case REQ_SS_REGISTER: {
-                                Msg_SS_Register msg; recv(sock_fd, &msg, sizeof(msg), 0);
-                                log_event("Socket %d (%s): SS registered at %s:%d. Expecting %d files.", sock_fd, peer_ip, msg.ss_ip, msg.client_port, msg.file_count);
-                                ss_state[sock_fd].active = 1; strncpy(ss_state[sock_fd].ip, msg.ss_ip, MAX_IP_LEN);
-                                ss_state[sock_fd].client_port = msg.client_port; strncpy(ss_state[sock_fd].ip_addr, peer_ip, MAX_IP_LEN);
-                                // Assign SS ID for heartbeat tracking
-                                snprintf(ss_state[sock_fd].ss_id, MAX_USERNAME, "%s:%d", msg.ss_ip, msg.client_port);
-                                ss_state[sock_fd].last_heartbeat = time(NULL);
-                                ss_state[sock_fd].missed_heartbeats = 0;
-                                client_state[sock_fd].active = 0;
-                                
-                                // Detect recovery scenario: file_count==0 but has inactive files with backups
-                                int is_recovering = (msg.file_count == 0);
-                                if (is_recovering) {
-                                    int has_backups = 0;
-                                    for (int i = 0; i < MAX_FILES_IN_SYSTEM; i++) {
-                                        if (!file_catalog[i].active && file_catalog[i].ss_sock_fd == sock_fd && 
-                                            file_catalog[i].backup_ss_sock >= 0) {
-                                            has_backups = 1;
-                                            break;
-                                        }
-                                    }
-                                    if (has_backups) {
-                                        log_event("  -> Detected recovery! Syncing files from backups...");
-                                        sync_files_to_recovering_ss(sock_fd);
-                                        send_ok_response(sock_fd);
-                                        break;
-                                    }
-                                }
-                                
-                                log_event("Receiving file list from SS %d...", sock_fd);
-                                for (int i = 0; i < msg.file_count; i++) {
-                                    Msg_File_Item item; recv(sock_fd, &item, sizeof(item), 0);
-                                    int slot = find_empty_file_slot();
-                                    if (slot != -1) {
-                                        file_catalog[slot].active = 1; 
-                                        strncpy(file_catalog[slot].filename, item.filename, MAX_FILENAME);
-                                        file_catalog[slot].ss_sock_fd = sock_fd; 
-                                        strncpy(file_catalog[slot].owner, item.owner, MAX_USERNAME);
-                                        file_catalog[slot].access_count = item.access_count;
-                                        for (int j = 0; j < item.access_count; j++) {
-                                            file_catalog[slot].access_list[j] = item.access_list[j];
-                                        }
-                                        
-                                        // Assign backup SS if multiple SS available
-                                        if (count_active_ss() >= 2) {
-                                            int backup = find_backup_ss(sock_fd);
-                                            if (backup >= 0) {
-                                                file_catalog[slot].backup_ss_sock = backup;
-                                                replicate_to_backup(backup, &file_catalog[slot]);
-                                            } else {
-                                                file_catalog[slot].backup_ss_sock = -1;
-                                            }
-                                        } else {
-                                            file_catalog[slot].backup_ss_sock = -1;
-                                        }
-                                        
-                                        // ADD TO HASHMAP
-                                        add_to_hashmap(item.filename, slot);
-                                        log_event("  -> Cataloged '%s' (owner: %s, %d access entries) in slot %d", 
-                                            item.filename, item.owner, item.access_count, slot);
-                                    }
-                                }
-                                send_ok_response(sock_fd);
+                                handle_ss_register(sock_fd, peer_ip);
                                 break;
                             }
                             case REQ_CREATE: {
@@ -723,8 +410,7 @@ int main() {
                                     if (strstr(filename, ".bak") || strstr(filename, ".checkpoints/") || strstr(filename, "/.checkpoints/")) continue;
                                     if (req.flag_a || has_read_access(&file_catalog[i], client_state[sock_fd].username)) {
                                         if (req.flag_l) {
-                                            file_catalog[i].active = 1;
-                                            send_full_metadata(sock_fd, &file_catalog[i]);
+                                            send_full_metadata(sock_fd, &file_catalog[i], RES_VIEW_ITEM_LONG);
                                         } else {
                                             res_hdr.type = RES_VIEW_ITEM_SHORT; res_hdr.payload_size = sizeof(Msg_View_Item_Short);
                                             Msg_View_Item_Short item; strncpy(item.filename, file_catalog[i].filename, MAX_FILENAME);
@@ -741,7 +427,7 @@ int main() {
                                 if (slot == -1) { send_simple_header(sock_fd, RES_ERROR_NOT_FOUND); break; }
                                 FileMetadata* meta = &file_catalog[slot];
                                 // INFO is public - no permission check needed (like ls -al)
-                                meta->active = 0; send_full_metadata(sock_fd, meta); meta->active = 1;
+                                send_full_metadata(sock_fd, meta, RES_INFO);
                                 break;
                             }
                             case REQ_ADD_ACCESS: {
