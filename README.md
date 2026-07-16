@@ -10,9 +10,9 @@ The project consists of three main components communicating via a custom TCP pro
 
 ```mermaid
 graph TD
-    Client[Client App] <-->|1. Query Location / Permission| NM[Naming Server]
-    Client <-->|2. Direct I/O (Read/Write/Stream)| SS[Storage Servers]
-    NM <-->|3. Heartbeats / Sync / Admin| SS
+    Client["Client App"] <-->|"1. Query Location / Permission"| NM["Naming Server"]
+    Client <-->|"2. Direct I/O (Read/Write/Stream)"| SS["Storage Servers"]
+    NM <-->|"3. Heartbeats / Sync / Admin"| SS
 ```
 
 ### 1. Client (`client_app`)
