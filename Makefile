@@ -16,8 +16,8 @@ SS_EXEC = storage_server
 # --- Object Files ---
 # The .o files also go into their respective folders
 CLIENT_OBJ = client/client.o client/handlers.o
-NS_OBJ = name/name_server.o name/hash_cache.o name/fault_tolerance.o name/catalog.o
-SS_OBJ = storage/storage_server.o storage/locks.o storage/document.o storage/metadata.o
+NS_OBJ = name/name_server.o name/hash_cache.o name/fault_tolerance.o name/catalog.o name/handlers.o
+SS_OBJ = storage/storage_server.o storage/locks.o storage/document.o storage/metadata.o storage/handlers.o
 
 # --- Header Files ---
 COMMON_HEADER = protocol/protocol.h
@@ -63,6 +63,9 @@ name/fault_tolerance.o: name/fault_tolerance.c name/fault_tolerance.h name/name_
 name/catalog.o: name/catalog.c name/catalog.h name/name_globals.h name/hash_cache.h $(COMMON_HEADER)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+name/handlers.o: name/handlers.c name/handlers.h name/name_globals.h $(COMMON_HEADER)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
 storage/storage_server.o: storage/storage_server.c $(COMMON_HEADER)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
@@ -73,6 +76,9 @@ storage/document.o: storage/document.c storage/document.h storage/storage_global
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 storage/metadata.o: storage/metadata.c storage/metadata.h storage/storage_globals.h storage/document.h $(COMMON_HEADER)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+storage/handlers.o: storage/handlers.c storage/handlers.h storage/storage_globals.h $(COMMON_HEADER)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # --- Cleanup Rule ---

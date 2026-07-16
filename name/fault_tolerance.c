@@ -1,8 +1,11 @@
+// Implementation of Naming Server (NM) fault tolerance mechanisms.
+
 #include "fault_tolerance.h"
 #include <string.h>
 #include <stdlib.h>
 #include <sys/socket.h>
 
+// Finds a secondary Storage Server to use for backups.
 int find_backup_ss(int primary_sock) {
     // Find a different active SS to use as backup
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
@@ -10,9 +13,10 @@ int find_backup_ss(int primary_sock) {
             return i;
         }
     }
-    return -1; // No backup available
+    return -1; // No backup available (only 1 SS in the system)
 }
 
+// Counts active Storage Servers to determine if replication is possible.
 int count_active_ss() {
     int count = 0;
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
@@ -21,8 +25,9 @@ int count_active_ss() {
     return count;
 }
 
+// Initiates an asynchronous data transfer to a backup SS.
 void replicate_to_backup(int backup_sock, FileMetadata* file) {
-    // Send async replication request to backup SS
+    // Construct the replication request message
     Header header;
     header.type = REQ_REPLICATE_FILE;
     header.payload_size = sizeof(Msg_Replicate_File);
@@ -36,7 +41,7 @@ void replicate_to_backup(int backup_sock, FileMetadata* file) {
     }
     rep_msg.file_size = file->file_size;
     
-    // Use MSG_DONTWAIT for async send
+    // Use MSG_DONTWAIT for async send to prevent blocking the central NM
     if (send(backup_sock, &header, sizeof(header), MSG_DONTWAIT) < 0) {
         log_event("  -> Warning: Failed to send replication header to backup SS");
         return;
@@ -50,6 +55,7 @@ void replicate_to_backup(int backup_sock, FileMetadata* file) {
              file->filename, backup_sock);
 }
 
+// Syncs a single file from a surviving backup back to the recovering primary SS.
 void sync_file_to_recovering_ss(int recovering_sock, int backup_sock, const char* filename) {
     // Request file content from backup SS
     Header req_header;
@@ -69,6 +75,7 @@ void sync_file_to_recovering_ss(int recovering_sock, int backup_sock, const char
     if (file_size > 0) {
         char* content = malloc(file_size);
         if (content) {
+            // Read entire file content from backup
             int received = 0;
             while (received < file_size) {
                 int bytes = recv(backup_sock, content + received, file_size - received, 0);
@@ -76,7 +83,7 @@ void sync_file_to_recovering_ss(int recovering_sock, int backup_sock, const char
                 received += bytes;
             }
             
-            // Send to recovering SS
+            // Forward the file content to the recovering SS
             Header sync_header;
             sync_header.type = REQ_SYNC_FROM_BACKUP;
             sync_header.payload_size = sizeof(Msg_Sync_File);
@@ -92,16 +99,19 @@ void sync_file_to_recovering_ss(int recovering_sock, int backup_sock, const char
     }
 }
 
+// Main recovery loop executed when a failed SS reconnects.
 void sync_files_to_recovering_ss(int recovering_sock) {
     // Find all files that belong to this SS and sync from their backups
     int synced_count = 0;
     for (int i = 0; i < MAX_FILES_IN_SYSTEM; i++) {
+        // If file is inactive, belongs to this SS, and has a live backup
         if (!file_catalog[i].active && file_catalog[i].ss_sock_fd == recovering_sock && 
             file_catalog[i].backup_ss_sock >= 0 && ss_state[file_catalog[i].backup_ss_sock].active) {
             
             sync_file_to_recovering_ss(recovering_sock, file_catalog[i].backup_ss_sock, 
                                       file_catalog[i].filename);
-            file_catalog[i].active = 1; // Reactivate file
+            
+            file_catalog[i].active = 1; // Reactivate file in the catalog
             synced_count++;
         }
     }

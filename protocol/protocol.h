@@ -1,3 +1,5 @@
+// Common protocol definitions for the Distributed Document System.
+
 #ifndef PROTOCOL_H
 #define PROTOCOL_H
 
@@ -23,36 +25,36 @@
 // --- 2. PERMISSION LEVELS ---
 typedef enum { NO_PERM, READ_ONLY, READ_WRITE } PermissionLevel;
 
-// --- 3. MESSAGE TYPES ---
+// Identifies the exact type and purpose of a network message.
 typedef enum {
-    // Phase 1
+    // Phase 1: Registration & Init
     REQ_CLIENT_REGISTER, REQ_SS_REGISTER, REQ_SS_FILE_ITEM,
     RES_OK, RES_ERROR,
-    // Phase 2
+    // Phase 2: File Creation & Reading
     REQ_CREATE, REQ_SS_CREATE, RES_ERROR_FILE_EXISTS,
     REQ_READ, RES_READ_LOCATION, REQ_CLIENT_READ,
     RES_ERROR_NOT_FOUND, RES_SS_FILE_OK,
-    // Phase 3
+    // Phase 3: File Writing & Editing
     REQ_WRITE, REQ_CLIENT_WRITE, RES_OK_LOCKED,
     RES_ERROR_LOCKED, REQ_WRITE_UPDATE, REQ_ETIRW,
     RES_ERROR_INVALID_SENTENCE, RES_ERROR_INVALID_WORD,
-    // Phase 4
+    // Phase 4: Listing, Deletion, and Streaming
     REQ_LIST, RES_LIST_HDR, RES_LIST_ITEM,
     REQ_DELETE, REQ_SS_DELETE, REQ_UNDO, REQ_SS_UNDO,
     REQ_STREAM, REQ_CLIENT_STREAM,
     RES_ERROR_ACCESS_DENIED,
-    // Phase 5
+    // Phase 5: Metadata, Viewing, and Access Control
     REQ_UPDATE_METADATA, REQ_VIEW, RES_VIEW_HDR,
     RES_VIEW_ITEM_SHORT, RES_VIEW_ITEM_LONG, REQ_INFO,
     RES_INFO, REQ_ADD_ACCESS, REQ_REM_ACCESS,
     REQ_SS_ADD_ACCESS, REQ_SS_REM_ACCESS,  // NM -> SS for access control updates
 
-    // --- NEW: Exec ---
+    // --- Exec ---
     REQ_EXEC,           // Client -> NM
     RES_EXEC_OUTPUT,    // NM -> Client (sends one line of output)
     RES_EXEC_DONE,      // NM -> Client (signals end of output)
 
-    // --- NEW: Folder Operations ---
+    // --- Folder Operations ---
     REQ_CREATEFOLDER,   // Client -> NM
     REQ_SS_CREATEFOLDER, // NM -> SS
     REQ_MOVE,           // Client -> NM
@@ -60,7 +62,7 @@ typedef enum {
     REQ_VIEWFOLDER,     // Client -> NM
     REQ_SS_CHECKFOLDER,  // NM -> SS (check if folder exists)
 
-    // --- NEW: Checkpoint Operations ---
+    // --- Checkpoint Operations ---
     REQ_CHECKPOINT,      // Client -> NM
     REQ_SS_CHECKPOINT,   // NM -> SS
     REQ_VIEWCHECKPOINT,  // Client -> NM
@@ -71,14 +73,14 @@ typedef enum {
     REQ_SS_LISTCHECKPOINTS, // NM -> SS
     RES_CHECKPOINT_LIST,  // SS -> NM -> Client
 
-    // --- NEW: Access Request Operations ---
+    // --- Access Request Operations ---
     REQ_REQUEST_ACCESS,  // Client -> NM (request access to a file)
     REQ_CHECK_REQUESTS,  // Client -> NM (owner checks pending requests)
     RES_REQUEST_LIST,    // NM -> Client (list of pending requests)
     REQ_APPROVE_REQUEST, // Client -> NM (approve a request)
     REQ_DENY_REQUEST,    // Client -> NM (deny/remove a request)
 
-    // --- NEW: Fault Tolerance Operations ---
+    // --- Fault Tolerance Operations ---
     REQ_REPLICATE_FILE,    // NM -> SS (replicate file to backup)
     REQ_SS_HEARTBEAT,      // NM -> SS (heartbeat check)
     RES_SS_HEARTBEAT,      // SS -> NM (heartbeat response)
@@ -88,7 +90,12 @@ typedef enum {
 } MessageType;
 
 // --- 4. HEADER STRUCT ---
-typedef struct { MessageType type; int payload_size; } Header;
+
+// Universal header prepended to EVERY message sent over the network.
+typedef struct { 
+    MessageType type;      // < Identifies the action/command.
+    int payload_size;      // < Bytes of payload following this header.
+} Header;
 
 // --- 5. MESSAGE PAYLOADS (Structs) ---
 typedef struct { char username[MAX_USERNAME]; PermissionLevel permission; } AccessEntry;

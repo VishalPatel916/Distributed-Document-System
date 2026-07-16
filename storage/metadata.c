@@ -1,3 +1,5 @@
+// Implementation of Storage Server (SS) metadata and file operations.
+
 #include "metadata.h"
 #include "document.h"
 #include "locks.h"
@@ -14,6 +16,7 @@
 #include <arpa/inet.h>
 #include <ctype.h>
 
+// Save file metadata list back to disk.
 void save_file_metadata(char* filename, char* owner, int access_count, AccessEntry* access_list) {
     FILE* f = fopen(METADATA_FILE, "r");
     FileMetadata_SS metadata[MAX_FILES_PER_SS];
@@ -59,7 +62,10 @@ void save_file_metadata(char* filename, char* owner, int access_count, AccessEnt
     }
     
     f = fopen(METADATA_FILE, "w");
-    if (f == NULL) { log_event("ERROR: Failed to save metadata"); return; }
+    if (f == NULL) { 
+        log_event("ERROR: Failed to save metadata"); 
+        return; 
+    }
     fprintf(f, "%d\n", meta_count);
     for (int i = 0; i < meta_count; i++) {
         fprintf(f, "%s\n%s\n%d\n", metadata[i].filename, metadata[i].owner, metadata[i].access_count);
@@ -71,6 +77,7 @@ void save_file_metadata(char* filename, char* owner, int access_count, AccessEnt
     log_event("  -> Metadata saved for '%s'", filename);
 }
 
+// Load file metadata from disk.
 void load_file_metadata(char* filename, char* owner_out, int* access_count_out, AccessEntry* access_list_out) {
     FILE* f = fopen(METADATA_FILE, "r");
     if (f == NULL) {
@@ -119,6 +126,7 @@ void load_file_metadata(char* filename, char* owner_out, int* access_count_out, 
     *access_count_out = 0;
 }
 
+// Delete file metadata from disk.
 void delete_file_metadata(char* filename) {
     FILE* f = fopen(METADATA_FILE, "r");
     if (f == NULL) return;
@@ -162,60 +170,150 @@ void delete_file_metadata(char* filename) {
     fclose(f);
 }
 
+// Calculate metadata stats and notify Name Server.
 void calculate_and_send_metadata(int nm_sock, char* filename, char* file_path) {
     FILE* f = fopen(file_path, "r");
-    if (f == NULL) { log_event("  -> ERROR: Could not open file %s to calculate metadata.", file_path); return; }
-    long file_size = 0; int word_count = 0; int char_count = 0; int in_word = 0; char c;
-    fseek(f, 0, SEEK_END); file_size = ftell(f); rewind(f);
+    if (f == NULL) { 
+        log_event("  -> ERROR: Could not open file %s to calculate metadata.", file_path); 
+        return; 
+    }
+    
+    long file_size = 0; 
+    int word_count = 0; 
+    int char_count = 0; 
+    int in_word = 0; 
+    char c;
+    
+    fseek(f, 0, SEEK_END); 
+    file_size = ftell(f); 
+    rewind(f);
+    
     while ((c = fgetc(f)) != EOF) {
         char_count++;
-        if (isspace(c)) { in_word = 0; } else { if (in_word == 0) { word_count++; in_word = 1; } }
+        if (isspace(c)) { 
+            in_word = 0; 
+        } else { 
+            if (in_word == 0) { 
+                word_count++; 
+                in_word = 1; 
+            } 
+        }
     }
     fclose(f);
-    struct stat st; time_t mod_time = 0; time_t access_time = 0;
-    if (stat(file_path, &st) == 0) { mod_time = st.st_mtime; access_time = st.st_atime; }
+    
+    struct stat st; 
+    time_t mod_time = 0; 
+    time_t access_time = 0;
+    if (stat(file_path, &st) == 0) { 
+        mod_time = st.st_mtime; 
+        access_time = st.st_atime; 
+    }
+    
     log_event("  -> Calculated stats for '%s': size=%ld, words=%d, chars=%d", filename, file_size, word_count, char_count);
-    Header header; header.type = REQ_UPDATE_METADATA; header.payload_size = sizeof(Msg_Update_Metadata);
+    Header header; 
+    header.type = REQ_UPDATE_METADATA; 
+    header.payload_size = sizeof(Msg_Update_Metadata);
+    
     Msg_Update_Metadata msg;
     strncpy(msg.filename, filename, MAX_FILENAME);
-    msg.file_size = file_size; msg.word_count = word_count; msg.char_count = char_count;
-    msg.last_modified = mod_time; msg.last_accessed = access_time;
-    if (send(nm_sock, &header, sizeof(header), 0) < 0) log_event("  -> ERROR: send metadata header failed");
-    if (send(nm_sock, &msg, sizeof(msg), 0) < 0) log_event("  -> ERROR: send metadata payload failed");
+    msg.file_size = file_size; 
+    msg.word_count = word_count; 
+    msg.char_count = char_count;
+    msg.last_modified = mod_time; 
+    msg.last_accessed = access_time;
+    
+    if (send(nm_sock, &header, sizeof(header), 0) < 0) {
+        log_event("  -> ERROR: send metadata header failed");
+    }
+    if (send(nm_sock, &msg, sizeof(msg), 0) < 0) {
+        log_event("  -> ERROR: send metadata payload failed");
+    }
 }
 
+// Handle file creation on local disk.
 void handle_create_file(char* filename, char* file_path) {
     sprintf(file_path, "%s/%s", g_storage_path, filename);
     log_event("  -> Creating file at: %s", file_path);
     FILE* f = fopen(file_path, "w");
-    if (f) { fclose(f); }
+    if (f) { 
+        fclose(f); 
+    }
 }
 
-void handle_send_file(int client_sock, char* filename) { char file_path[768]; sprintf(file_path, "%s/%s", g_storage_path, filename); int fd = open(file_path, O_RDONLY); if (fd < 0) { log_event("  -> File not found. Sending error to socket %d", client_sock); send_simple_header(client_sock, RES_ERROR_NOT_FOUND); return; } send_simple_header(client_sock, RES_SS_FILE_OK); log_event("  -> Sending file '%s' to socket %d", filename, client_sock); char buffer[FILE_BUFFER_SIZE]; int bytes_read; while ((bytes_read = read(fd, buffer, FILE_BUFFER_SIZE)) > 0) if (send(client_sock, buffer, bytes_read, 0) < 0) break; close(fd); log_event("  -> Finished sending file to socket %d", client_sock); }
+// Read and send entire file contents to client socket.
+void handle_send_file(int client_sock, char* filename) { 
+    char file_path[768]; 
+    sprintf(file_path, "%s/%s", g_storage_path, filename); 
+    int fd = open(file_path, O_RDONLY); 
+    
+    if (fd < 0) { 
+        log_event("  -> File not found. Sending error to socket %d", client_sock); 
+        send_simple_header(client_sock, RES_ERROR_NOT_FOUND); 
+        return; 
+    } 
+    
+    send_simple_header(client_sock, RES_SS_FILE_OK); 
+    log_event("  -> Sending file '%s' to socket %d", filename, client_sock); 
+    
+    char buffer[FILE_BUFFER_SIZE]; 
+    int bytes_read; 
+    while ((bytes_read = read(fd, buffer, FILE_BUFFER_SIZE)) > 0) {
+        if (send(client_sock, buffer, bytes_read, 0) < 0) {
+            break;
+        }
+    }
+    close(fd); 
+    log_event("  -> Finished sending file to socket %d", client_sock); 
+}
 
+// Stream file contents word by word with artificial delay.
 void handle_stream_file(int client_sock, char* filename) {
-    char file_path[768]; sprintf(file_path, "%s/%s", g_storage_path, filename);
+    char file_path[768]; 
+    sprintf(file_path, "%s/%s", g_storage_path, filename);
     int fd = open(file_path, O_RDONLY);
-    if (fd < 0) { log_event("  -> File not found. Sending error to socket %d", client_sock); send_simple_header(client_sock, RES_ERROR_NOT_FOUND); return; }
+    
+    if (fd < 0) { 
+        log_event("  -> File not found. Sending error to socket %d", client_sock); 
+        send_simple_header(client_sock, RES_ERROR_NOT_FOUND); 
+        return; 
+    }
+    
     send_simple_header(client_sock, RES_SS_FILE_OK);
-    lseek(fd, 0, SEEK_END); long file_size = lseek(fd, 0, SEEK_CUR); lseek(fd, 0, SEEK_SET);
+    
+    lseek(fd, 0, SEEK_END); 
+    long file_size = lseek(fd, 0, SEEK_CUR); 
+    lseek(fd, 0, SEEK_SET);
+    
     char* mem_buffer = (char*)malloc(file_size + 1);
-    if (!mem_buffer) { perror("malloc stream buffer"); close(fd); return; }
-    read(fd, mem_buffer, file_size); mem_buffer[file_size] = '\0'; close(fd);
+    if (!mem_buffer) { 
+        perror("malloc stream buffer"); 
+        close(fd); 
+        return; 
+    }
+    
+    if (read(fd, mem_buffer, file_size) < 0) {
+        perror("read stream file");
+    }
+    mem_buffer[file_size] = '\0'; 
+    close(fd);
+    
     log_event("  -> Streaming file '%s' to socket %d", filename, client_sock);
-    char* word_context = NULL; char* word = strtok_r(mem_buffer, " \n\t", &word_context);
+    char* word_context = NULL; 
+    char* word = strtok_r(mem_buffer, " \n\t", &word_context);
     while (word != NULL) {
         if (send(client_sock, word, strlen(word), 0) < 0) break;
         if (send(client_sock, " ", 1, 0) < 0) break;
         usleep(100000); 
         word = strtok_r(NULL, " \n\t", &word_context);
     }
-    free(mem_buffer); log_event("  -> Finished streaming file to socket %d", client_sock);
+    free(mem_buffer); 
+    log_event("  -> Finished streaming file to socket %d", client_sock);
 }
 
+// Recursively scan directories to build local file list.
 void scan_directory_recursive(const char* base_path, const char* relative_path, 
                                char files[][MAX_FILENAME], int* count, int max_count) {
-    char full_path[1024];
+    char full_path[2048];
     if (relative_path && strlen(relative_path) > 0) {
         snprintf(full_path, sizeof(full_path), "%s/%s", base_path, relative_path);
     } else {
@@ -230,20 +328,17 @@ void scan_directory_recursive(const char* base_path, const char* relative_path,
     while ((dir = readdir(d)) != NULL && *count < max_count) {
         if (strcmp(dir->d_name, ".") == 0 || strcmp(dir->d_name, "..") == 0) continue;
         if (strcmp(dir->d_name, ".metadata") == 0) continue;
+        if (strlen(full_path) + strlen(dir->d_name) + 2 > sizeof(full_path)) continue;
         
-        // Check path length before concatenating
-        if (strlen(full_path) + strlen(dir->d_name) + 2 > 1024) continue;
-        
-        char item_path[1024];
+        char item_path[2048];
         snprintf(item_path, sizeof(item_path), "%s/%s", full_path, dir->d_name);
         
         struct stat statbuf;
         if (stat(item_path, &statbuf) == 0) {
             if (S_ISDIR(statbuf.st_mode)) {
-                // Directory - recurse into it
-                char new_relative[512];
+                char new_relative[1024];
                 if (relative_path && strlen(relative_path) > 0) {
-                    if (strlen(relative_path) + strlen(dir->d_name) + 2 > 512) continue;
+                    if (strlen(relative_path) + strlen(dir->d_name) + 2 > sizeof(new_relative)) continue;
                     snprintf(new_relative, sizeof(new_relative), "%s/%s", relative_path, dir->d_name);
                 } else {
                     strncpy(new_relative, dir->d_name, sizeof(new_relative));
@@ -251,7 +346,6 @@ void scan_directory_recursive(const char* base_path, const char* relative_path,
                 }
                 scan_directory_recursive(base_path, new_relative, files, count, max_count);
             } else if (S_ISREG(statbuf.st_mode)) {
-                // Regular file - check length before adding
                 if (relative_path && strlen(relative_path) > 0) {
                     if (strlen(relative_path) + strlen(dir->d_name) + 2 > MAX_FILENAME) continue;
                     snprintf(files[*count], MAX_FILENAME, "%s/%s", relative_path, dir->d_name);
@@ -267,10 +361,14 @@ void scan_directory_recursive(const char* base_path, const char* relative_path,
     closedir(d);
 }
 
+// Clean up write session when client disconnects.
 void handle_client_disconnect(int sock_fd, fd_set* master_set) {
-    struct sockaddr_in addr; socklen_t len = sizeof(addr);
+    struct sockaddr_in addr; 
+    socklen_t len = sizeof(addr);
     char ip_buf[MAX_IP_LEN] = "UNKNOWN_IP";
-    if (getpeername(sock_fd, (struct sockaddr*)&addr, &len) == 0) { strncpy(ip_buf, inet_ntoa(addr.sin_addr), MAX_IP_LEN); }
+    if (getpeername(sock_fd, (struct sockaddr*)&addr, &len) == 0) { 
+        strncpy(ip_buf, inet_ntoa(addr.sin_addr), MAX_IP_LEN); 
+    }
     log_event("Client on socket %d (%s) disconnected", sock_fd, ip_buf);
     
     if (write_sessions[sock_fd].active) {
@@ -281,7 +379,6 @@ void handle_client_disconnect(int sock_fd, fd_set* master_set) {
         release_lock(doc->filename, session->sentence_ptr);
         release_active_doc(doc);
         
-        // Clean up edit operations
         if (session->edit_ops != NULL) {
             free(session->edit_ops);
             session->edit_ops = NULL;
@@ -291,4 +388,3 @@ void handle_client_disconnect(int sock_fd, fd_set* master_set) {
     close(sock_fd);
     FD_CLR(sock_fd, master_set);
 }
-
